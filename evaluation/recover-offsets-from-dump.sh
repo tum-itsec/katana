@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -eu
+
+MAIN="$(dirname "$(dirname "$(readlink -f "$0")")")"
+DUMP="$(readlink -f "$1")"
+FIELDS="$(readlink -f "$2")"
+STRUCTLAYOUT="$(readlink -f "$3")"
+
+PROJECT_DIR="$(mktemp -d)"
+function cleanup {
+	rm -rf "$PROJECT_DIR"
+}
+trap cleanup EXIT
+
+PROJECT_NAME="automated-analysis"
+export _JAVA_OPTIONS="-Xmx12g"
+
+python3 "${MAIN}/write_paging_to_file.py" "${DUMP}"
+
+cd "${MAIN}/pcode"
+ghidra-analyzeHeadless "$PROJECT_DIR" $PROJECT_NAME \
+	-import "$DUMP" \
+	-noanalysis \
+	-readOnly \
+	-loader BinaryLoader \
+	-loader-baseAddr 0x0 \
+	-cspec gcc \
+	-processor x86:LE:64:default \
+	-postScript main.py "$FIELDS" "analyze_dump" \
+	-scriptPath "./" \
+	-scriptlog "./log.txt" \
+	| tee "${DUMP}-analysis"
+
+python3 "${MAIN}/resolve_direct_accesses.py" "${DUMP}-layout" "${STRUCTLAYOUT}" | tee -a "${DUMP}-analysis"
+

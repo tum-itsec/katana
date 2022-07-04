@@ -1,0 +1,15 @@
+FROM ubuntu:trusty
+RUN apt-get -y update && apt-get upgrade -y
+RUN apt-get -y install build-essential git gcc libncurses5-dev bison flex libelf-dev vim bc
+RUN git clone https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git /linux/
+RUN apt-get -y install gcc-4.7 g++-4.7 gcc-4.7-plugin-dev
+RUN apt-get -y install gcc-4.8-plugin-dev
+RUN apt-get -y install openssl libssl-dev
+RUN mkdir /output
+COPY gcc-plugin /gcc-plugin-4.8/
+RUN cd /gcc-plugin-4.8/ && make clean && make CXX="g++-4.8"
+COPY docker-build-kernel.sh /linux/
+WORKDIR /linux
+
+ENTRYPOINT ["./docker-build-kernel.sh"]
+CMD []

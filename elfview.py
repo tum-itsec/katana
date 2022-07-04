@@ -1,0 +1,741 @@
+from elftools.elf.elffile import ELFFile
+import functools
+import mmap
+import struct
+import os
+from extract_cr3 import extract_cpu_states
+import pagetable
+import bisect
+import abc
+import enum
+
+PAGESIZE = 0x1000
+MAX_PAGES_IN_HOLES = 0x100 # for memory-mapped devices where the mapping is not marked with cache-disable or write-through flags
+
+class NotMapped(Exception):
+    pass
+
+def instance_caching(fn):
+    """Makes the decorated method cache its results within the instance on which
+    it is invoked."""
+    @functools.wraps(fn)
+    def _inner(self, *args):
+        if not hasattr(self, '_cache'):
+            self._cache = {}
+        if not fn in self._cache:
+            self._cache[fn] = {}
+        if args not in self._cache[fn]:
+            self._cache[fn][args] = fn(self, *args)
+        return self._cache[fn][args]
+    return _inner
+
+def autoselect(filename, **kwargs):
+    with open(filename, "rb") as f:
+        elf = ELFFile(f)
+        t = elf.header.e_type
+
+        if t == "ET_CORE":
+            # Check for hlts custom dump format
+            for s in elf.iter_segments():
+                if s.header['p_type'] == 'PT_NOTE':
+                    for n in s.iter_notes():
+                        if n.n_name == 'UKM_ARCH':
+                            if isinstance(n.n_desc, str):
+                                arch = n.n_desc.encode()[0]
+                            elif isinstance(n.n_desc, bytes):
+                                arch = n.n_desc[0]
+                            else:
+                                raise ValueError('Unexpected description type')
+                            if arch == 0:
+                                # x86-64
+                                return X86PagedELFMemoryView(filename, **kwargs)
+                            elif arch == 1:
+                                # i386 (maybe, eventually)
+                                raise NotImplementedError('i386 memory dumps not implemented')
+                            elif arch == 2:
+                                # MIPS32
+                                return MipsMemoryView(filename, **kwargs)
+                            elif arch == 3:
+                                # ARM64
+                                return Arm64MemoryView(filename, **kwargs)
+                            elif arch == 4:
+                                # MIPS32 EL (for the R3K device we currently have)
+                                return MipsMemoryView(filename, **kwargs, endianness="<")
+            # Old dumps without ARCH note (always MIPS)
+            for s in elf.iter_segments():
+                if s.header["p_type"] == 'PT_NOTE':
+                    for n in s.iter_notes():
+                        if n.n_name == "REG" and n.n_type == 0xff:
+                            return MipsMemoryView(filename, **kwargs)
+            # /proc/kcore
+            for s in elf.iter_segments():
+                if s.header["p_type"] == 'PT_NOTE':
+                    for n in s.iter_notes():
+                        if n.n_type == 'NT_TASKSTRUCT':
+                            # TODO: Check architecture?
+                            # TODO: Don't force ignore_paddr
+                            return i386MemoryView(filename, **kwargs, ignore_paddr=True)
+
+            if elf.header["e_machine"] == 'EM_ARM':
+                return Arm32MemoryView(filename, **kwargs)
+
+            # Assume QEMU memory dump
+            return X86MemoryView(filename, **kwargs)
+        elif t in ["ET_EXEC", "ET_DYN"]:
+            # Assume vmlinux file
+            return ELFKernelImage(filename, **kwargs)
+        else:
+            print("Error: Unknown Elf File")
+            return None
+
+class ELFKernelImage():
+    def __init__(self, filename, need_symbols = False):
+        self.raw_file = open(filename, "rb")
+        self._elf = ELFFile(self.raw_file)
+
+        stab = self._elf.get_section_by_name(".symtab")
+
+        # Load symbols into a cache as iter_symbols seems to be horribly slow
+        if need_symbols:
+            self.syms = list((x.name, x.entry.st_value, x.entry.st_size) for x in stab.iter_symbols())
+            self.syms = sorted(self.syms, key=lambda x: x[1])
+            self.syms_addr = [x[1] for x in self.syms] # for bisect lookup
+        else:
+            self.syms = []
+            self.syms_addr = []
+
+    def get_virt(self, addr, size):
+        offset = next(self._elf.address_offsets(addr), None)
+        if not offset:
+            raise NotMapped("NotMapped: Virtual Address - 0x{:016x}".format(addr))
+        else:
+            return os.pread(self.raw_file.fileno(), size, offset)
+
+    def has_virt(self, addr, size):
+        try:
+            self.get_virt(addr, size)
+            return True
+        except NotMapped:
+            return False
+
+    @instance_caching
+    def lookup_symbol(self, name):
+        return next((x for x in self.syms if x[0] == name), None)
+
+class ELFViewPhysOnly():
+    """Provides access to the physical mappings of an ELF Core file (as generated by Qemu)"""
+    def __init__(self, filename, ignore_paddr=False):
+        raw_file = open(filename, "rb")
+        self._elf = ELFFile(raw_file)
+        self._data = []
+        self._mem = []
+        too_many_phdrs = False
+        phdr_cache = {}
+        paddr_name = "p_paddr" if not ignore_paddr else "p_vaddr"
+
+        def add_phdr(phdr):
+            offset_aligned = (phdr["p_offset"] // PAGESIZE) * PAGESIZE
+            offset_delta = phdr["p_offset"] - offset_aligned
+            map_size = phdr["p_filesz"] + offset_delta
+            # print(hex(offset_aligned), hex(phdr["p_filesz"]), hex(map_size), hex(phdr["p_paddr"]), hex(phdr["p_vaddr"]))
+            if (offset_aligned, map_size) in phdr_cache and False:
+                m1_index = phdr_cache[(offset_aligned, map_size)]
+            else:
+                m1_index = len(self._mem)
+                # print(f"0x{map_size:x} 0x{offset_aligned:x}")
+                curpos = raw_file.tell()
+                raw_file.seek(0, os.SEEK_END)
+                file_size = raw_file.tell()
+                raw_file.seek(curpos)
+                m1 = mmap.mmap(raw_file.fileno(), min(map_size,file_size - offset_aligned), mmap.MAP_SHARED, mmap.PROT_READ, offset=offset_aligned)
+                self._mem.append(m1)
+                phdr_cache[(offset_aligned, map_size)] = m1_index
+            self._data.append((phdr[paddr_name] - offset_delta, phdr[paddr_name] + phdr["p_filesz"], m1_index, offset_delta, phdr))
+
+        for s in self._elf.iter_segments():
+            if s.header["p_type"] == "PT_NOTE":
+                for n in s.iter_notes():
+                    if n.n_name == 'ELF_TOO_MANY_PHDRS':
+                        break
+                        # Too many headers - get n.n_desc as raw binary and use that instead
+                        del self._data
+                        for m in self._mem:
+                            m.close()
+                        del self._mem
+                        self._data = []
+                        self._mem = []
+                        raw_data = n.n_desc.encode('latin-1') # ELFFile does bytes2string, which is exactly the opposite of this
+                        for start in range(0, len(raw_data), self._elf.header.e_phentsize):
+                            header_data = raw_data[start:start + self._elf.header.e_phentsize]
+                            header = self._elf.structs.Elf_Phdr.parse(header_data)
+                            if header['p_type'] == 'PT_LOAD':
+                                add_phdr(header)
+                        too_many_phdrs = True
+                        break
+            if too_many_phdrs:
+                break
+            if s.header["p_type"] == "PT_LOAD":
+                #print("+ Loading {}".format(s.header.items()))
+                add_phdr(s.header)
+
+        self._data = sorted(self._data, key=lambda entry: entry[:-1])
+
+        # Throw away overlapped physical pages to allow proper bisecting (worst-case this is probably quadratic, but with large page tables (really only x86) we have a physmap that allows early exit at page 0)
+        self._phys = sorted(self._data, key=lambda entry: (entry[0], -(entry[1] - entry[0])))
+        index = 0
+        while index < len(self._phys) - 1:
+            successor = index + 1
+            while successor < len(self._phys):
+                if self._phys[successor][0] >= self._phys[index][1]: # Successor starts after we end, we are done
+                    break
+                elif self._phys[successor][1] <= self._phys[index][1]: # Successor ends with us, so we can drop it
+                    del self._phys[successor]
+                else:
+                    successor += 1
+            index += 1
+        self._phys = sorted(self._phys, key=lambda entry: entry[:-1])
+
+    def has(self, addr, size=0x1000):
+        for i in self._phys:
+            if i[0] <= addr <= addr + size <= i[1]:
+                return True
+            elif i[0] <= addr < i[1] and addr + size > i[1]:
+                return self.has(i[1], size - (i[1] - addr))
+        return False
+
+    def get(self, addr, size):
+        block = bytearray(size)
+        remaining = [(addr, addr + size)]
+        def remove_remaining(mstart, mend):
+            nonlocal remaining
+            delete = []
+            add = []
+            for r in range(len(remaining)):
+                rstart, rend = remaining[r]
+                if mend <= rstart or mstart > rend: # No overlap
+                    continue
+                delete.append(r) # Some overlap
+                if mstart < rstart and mend > rend: # Covered fully
+                    pass
+                if rstart < mstart:
+                    add.append((rstart, mstart)) # Remaining stuff before mstart
+                if mend < rend:
+                    add.append((mend, rend)) # Remaining stuff after mend
+            for s in sorted(delete, reverse=True):
+                del remaining[s]
+            remaining.extend(add)
+            remaining = sorted(remaining)
+
+        target_end = addr + size
+        first_mapping = bisect.bisect_left(self._phys, (addr, 0, 0, 0, None))
+        if first_mapping >= len(self._phys):
+            first_mapping = len(self._phys) - 1
+        while self._phys[first_mapping][1] > addr and first_mapping > 0:
+            first_mapping -= 1
+        for index in range(first_mapping, len(self._phys)):
+            mstart, mend, mi, *_ = self._phys[index]
+            if mstart >= target_end:
+                break
+            if target_end <= mstart or mend <= addr:
+                continue
+            if mstart <= addr and mend >= target_end:
+                block[0:size] = self._mem[mi][addr - mstart : addr - mstart + size]
+                remaining = []
+                break
+            elif mstart < addr: # Overlap at start
+                block[:mend - addr] = self._mem[mi][addr - mstart:]
+                remove_remaining(addr, mend)
+            elif mend > target_end: # Overlap at end
+                block[mstart - addr:] = self._mem[mi][:target_end - mstart]
+                remove_remaining(mstart, target_end)
+            else: # Overlap in the middle
+                block[mstart - addr:mend - addr] = self._mem[mi][:]
+                remove_remaining(mstart, mend)
+        if remaining:
+            raise NotMapped("NotMapped: Physical Addresses: {:#018x} - {:#018x}: Ranges {}".format(addr, addr + size, ', '.join('{:#018x} - {:#018x}'.format(s, e) for s, e in remaining)))
+        return block
+
+    def phys_to_file_offset(self, paddr):
+        for start, end, _, delta, phdr in self._data:
+            if start <= paddr < end:
+                offset = paddr - start
+                return phdr['p_offset'] - delta + offset
+        raise NotMapped("NotMapped: Physical Address - 0x{:016x}".format(addr))
+
+    def end(self):
+        return self._data[-1][1]
+
+class MemoryView(abc.ABC):
+    def __init__(self, filename, need_symbols):
+        self.syms = []
+        self.syms_addr = []
+        self._syms = dict()
+        if need_symbols:
+            self._load_symbols(f"{filename}-globals")
+            self._load_symbols(f"{filename}-kallsym")
+            self._load_symbols(f"{filename}-symtab")
+            self.syms = sorted(((x, y) for x,y in self._syms.items()), key=lambda x: x[1])
+            self.syms_addr = [x[1] for x in self.syms] # for bisect lookup
+
+    def _load_symbols(self, filename):
+        if not os.path.exists(filename):
+            return
+        with open(filename, "r") as f:
+            for l in f.readlines():
+                name, addr = l.split(" ")
+                addr = int(addr, 16)
+                # FIXME: We need the correct size
+                self._syms[name] = addr
+
+    def lookup_symbol(self, name):
+        return self._syms.get(name, None)
+
+    def get_virt(self, addr, size):
+        data = b''
+        while len(data) < size:
+            vaddr = self.virt_to_phys(addr)
+            if vaddr is None:
+                raise NotMapped("NotMapped: Virtual Address - 0x{:016x}".format(addr))
+            new_data = self._view.get(vaddr, size)
+            addr += len(new_data)
+            data += new_data
+            size -= len(new_data)
+        return data
+
+    def has_virt(self, addr, size):
+        try:
+            self.get_virt(addr, size)
+            return True
+        except NotMapped:
+            return False
+
+    def get_phys(self, addr, size):
+        return self._view.get(addr, size)
+
+    def get_page_entry_phys(self, addr):
+        for i in self.mapping:
+            if i.phys < addr < i.phys + i.size:
+                return i
+
+    def get_page_entry_virt(self, addr):
+        return self.get_page_entry_phys(self.virt_to_phys(addr))
+
+    def virt_to_phys(self, addr):
+        # We need a bisect search here, otherwise this operation is horribly slow
+        # Ugly hack incomming :-/
+        idx = bisect.bisect(self.mapping, (addr,))
+
+        # Correct bisect search, we might also need the previous element
+        if idx > 0:
+            idx -= 1
+
+        for i in self.mapping[idx:idx+2]:
+            if i.virt <= addr < i.virt + i.size:
+                #print("Value: 0x{0.virt:x} Size: 0x{0.size:x}".format(i))
+                return i.phys + (addr - i.virt)
+
+    def phys_to_virt(self, addr):
+        for i in self.mapping:
+            if i.phys < addr < i.phys + i.size:
+                yield i.virt + (addr - i.phys)
+
+    def iter_loads(self):
+        for i in self._view._phys:
+            yield (i[0], i[1], self._view._mem[i[2]])
+
+    def find(self, needle):
+        res = []
+        for paddr, paddr_end, d in self.iter_loads():
+            p = 0
+            while True:
+                p = d.find(needle, p)
+                if p == -1:
+                    break
+                res.append(paddr + p)
+                p += 1
+        return res
+
+    def virt_to_file_offset(self, addr):
+        return self.phys_to_file_offset(self.virt_to_phys(addr))
+
+    def phys_to_file_offset(self, paddr):
+        return self._view.phys_to_file_offset(paddr)
+
+    @abc.abstractproperty
+    def pointer_size(self):
+        pass
+
+    @abc.abstractproperty
+    def cpu_arch(self):
+        pass
+
+    @abc.abstractproperty
+    def byte_order(self):
+        pass
+
+class PagedELFMemoryView(MemoryView):
+    def __init__(self, filename, debug_paging=False, need_symbols=True, ignore_paddr=False):
+        super().__init__(filename, need_symbols)
+        self._view = ELFViewPhysOnly(filename, ignore_paddr=ignore_paddr)
+        self.mapping = []
+        paddr_name = "p_paddr" if not ignore_paddr else "p_vaddr"
+
+        for start, end, m, delta, hdr in self._view._data:
+            self.mapping.append(pagetable.PageEntry(hdr["p_vaddr"], hdr[paddr_name], hdr["p_filesz"], False, False, False))
+
+        self.mapping = sorted(self.mapping)
+
+class Arm64MemoryView(PagedELFMemoryView):
+    def __init__(self, filename, debug_paging=False, need_symbols=True):
+        super().__init__(filename, debug_paging, need_symbols)
+
+    @property
+    def pointer_size(self):
+        return 8
+
+    @property
+    def cpu_arch(self):
+        return "arm64"
+
+    @property
+    def byte_order(self):
+        return "<"
+
+class Arm32MemoryView(PagedELFMemoryView):
+    def __init__(self, filename, debug_paging=False, need_symbols=True):
+        super().__init__(filename, debug_paging, need_symbols)
+
+    @property
+    def pointer_size(self):
+        return 4
+
+    @property
+    def cpu_arch(self):
+        return "arm"
+
+    @property
+    def byte_order(self):
+        return "<"
+
+class MipsMemoryView(PagedELFMemoryView):
+    def __init__(self, filename, debug_paging=False, need_symbols=True, endianness=">"):
+        self.endianness = endianness
+        super().__init__(filename, debug_paging, need_symbols)
+
+    @property
+    def pointer_size(self):
+        return 4
+
+    @property
+    def cpu_arch(self):
+        return "mips"
+
+    @property
+    def byte_order(self):
+        return self.endianness
+
+class X86PagedELFMemoryView(PagedELFMemoryView):
+    """X86MemoryView for pre-paged ELF files (where segments have correct
+    virtual and physical addresses). Only choose this over X86MemoryView if you
+    are certain that the ELF file is already pre-paged and you do not need to
+    find the page table from a stored CR3 value or by examining memory"""
+    def __init__(self, filename, debug_paging=False, need_symbols=True):
+        super().__init__(filename, debug_paging, need_symbols)
+
+    @property
+    def pointer_size(self):
+        return 8
+
+    @property
+    def cpu_arch(self):
+        return "x86-64"
+
+    @property
+    def byte_order(self):
+        return "<"
+
+class i386MemoryView(PagedELFMemoryView):
+    def __init__(self, filename, debug_paging=False, need_symbols=True, ignore_paddr=False):
+        super().__init__(filename, debug_paging, need_symbols, ignore_paddr)
+
+    @property
+    def pointer_size(self):
+        return 4
+
+    @property
+    def cpu_arch(self):
+        return "i386"
+
+    @property
+    def byte_order(self):
+        return "<"
+
+class X86MemoryView(MemoryView):
+    def __init__(self, filename, need_symbols=True, debug_paging=False):
+        super().__init__(filename, need_symbols)
+        self._view = ELFViewPhysOnly(filename)
+
+        raw_file = open(filename, "rb")
+        elf = ELFFile(raw_file)
+        self.cpu_states = extract_cpu_states(elf)
+        cr3 = None
+
+        finder = PageTableFinder(self._view)
+        dpl = lambda segment: (segment.flags >> 13) & 0b11
+        cr3_file = '{}-cr3'.format(filename)
+        if os.path.exists(cr3_file):
+            with open(cr3_file) as cr3_stream:
+                cr3 = int(cr3_stream.read().strip(), 0)
+        else:
+            if self.cpu_states:
+                for state in self.cpu_states:
+                    if dpl(state.cs) == 0: # DPL 0: Kernel mode
+                        candidate = state.cr3 & 0xfffffffffffff000
+                        if debug_paging:
+                            print("Potential CR3:", hex(state.cs.flags), hex(candidate))
+                        coverage = finder.get_pml4_coverage(candidate)
+                        if coverage > 0:
+                            if debug_paging:
+                                print(" -> Coverage is {}".format(coverage))
+                            cr3 = candidate
+                            break
+                        else:
+                            print("Rejecting invalid CR3:", hex(candidate))
+            if cr3 is None:
+                cr3 = finder.find_page_table_in_memory(print if debug_paging else None)
+            with open(cr3_file, 'w') as cr3_stream:
+                cr3_stream.write(hex(cr3) + '\n')
+
+        self.mapping = pagetable.do_4level_paging(cr3, self.get_phys)
+        if debug_paging:
+            with open("pagetables-unmerged-dbg.txt", "w") as f:
+                for entry in self.mapping:
+                    f.write("[0x{:016x} - 0x{:016x}] -> [0x{:016x} - 0x{:016x}] (Size: 0x{:x}; {})\n".format(entry.virt, entry.virt + entry.size, entry.phys, entry.phys + entry.size, entry.size, "rw" if entry.rw else "r"))
+        self.mapping = pagetable.merge_pages(self.mapping)
+        if debug_paging:
+            with open("pagetables-dbg.txt", "w") as f:
+                for entry in self.mapping:
+                    f.write("[0x{:016x} - 0x{:016x}] -> [0x{:016x} - 0x{:016x}] (Size: 0x{:x}; {})\n".format(entry.virt, entry.virt + entry.size, entry.phys, entry.phys + entry.size, entry.size, "rw" if entry.rw else "r"))
+
+    @property
+    def pointer_size(self):
+        return 8
+
+    @property
+    def cpu_arch(self):
+        return "x86-64"
+
+    @property
+    def byte_order(self):
+        return "<"
+
+class PageTableFinder:
+    """Finds or validates the page table in an ELFView"""
+    def __init__(self, view):
+        self._view = view
+        self._in_hole_count = 0
+
+    # Validate four-level paging
+    def get_entry(self, addr):
+        return struct.unpack('<Q', self._view.get(addr, 8))[0]
+
+    def _for_each_present_entry(self, base, fn):
+        result = []
+        for offset in range(0, 0x1000, 8):
+            try:
+                entry = self.get_entry(base + offset)
+            except NotMapped:
+                return [None]
+            present = entry & 1
+            is_hw = (entry & 0b11000) != 0 # PCD (caching disabled) or PWT (writethrough), probably hardware-backed
+            if (not present) or is_hw:
+                # Ignore non-present entries
+                # Also ignore memory we think is hardware-backed, which
+                # we won't find in the core dump
+                continue
+            res = fn(entry)
+            if isinstance(res, list):
+                result.extend(res)
+            else:
+                result.append(res)
+        return result
+
+    def _no_none_or(self, a, b):
+        old_hole_count = self._in_hole_count
+        a = a() # deferred execution so we don't run b before checking a - keeps the logs cleaner...
+        if a is not None and None not in a:
+            return a
+        self._in_hole_count = old_hole_count
+        b = b()
+        if b is not None and None not in b:
+            return b
+        return [None]
+
+    def _is_user(self, entry):
+        return (entry & 0b100) != 0
+
+    @instance_caching
+    def _is_l1_page(self, entry, count, stack):
+        base = entry & 0x000ffffffffff000
+        size = 0x1000 # 4 KiB
+        if self._view.has(base, size):
+            return (base, base + size) if count else []
+        elif base < 0x100000: # Low memory < 1 MiB, probably BIOS-mapped
+            return (base, base + size) if count else []
+        elif 0 <= base < self._view.end() and self._in_hole_count < MAX_PAGES_IN_HOLES:
+            self._in_hole_count += 1
+            return (base, base + size) if count else []
+
+    @instance_caching
+    def _is_l2_page(self, entry, count, stack):
+        base = entry & 0x000ffffffffff000
+        size = 0x200000 # 2 MiB
+        if entry & 0x80 and self._view.has(base, size):
+            return (base, base + size) if count else []
+        elif base < 0x100000: # Low memory < 1 MiB, probably BIOS-mapped
+            return (base, base + size) if count else []
+        elif 0 <= base < self._view.end() and self._in_hole_count < MAX_PAGES_IN_HOLES:
+            self._in_hole_count += 1
+            return (base, base + size) if count else []
+
+    @instance_caching
+    def _is_l3_page(self, entry, count, stack):
+        base = entry & 0x000ffffffffff000
+        size = 0x40000000 # 1 GiB
+        if entry & 0x80 and self._view.has(base, size):
+            return (base, base + size) if count else []
+        elif base < 0x100000: # Low memory < 1 MiB, probably BIOS-mapped
+            return (base, base + size) if count else []
+        elif 0 <= base < self._view.end() and self._in_hole_count < MAX_PAGES_IN_HOLES:
+            self._in_hole_count += 1
+            return (base, base + size) if count else []
+
+    @instance_caching
+    def _is_page_table(self, base, count, stack):
+        return self._for_each_present_entry(
+            base,
+            lambda entry: self._is_l1_page(entry, count or not self._is_user(entry), stack + (base,))
+        )
+
+    @instance_caching
+    def _is_pdt(self, base, count, stack):
+        return self._for_each_present_entry(
+            base,
+            lambda entry: self._no_none_or(
+                lambda: self._is_page_table(entry & 0x000ffffffffff000, count or not self._is_user(entry), stack + (base,)),
+                lambda: self._is_l2_page(entry, count or not self._is_user(entry), stack + (base,))
+            )
+        )
+
+    @instance_caching
+    def _is_pdpt(self, base, count, stack):
+        return self._for_each_present_entry(
+            base,
+            lambda entry: self._no_none_or(
+                lambda: self._is_pdt(entry & 0x000ffffffffff000, count or not self._is_user(entry), stack + (base,)),
+                lambda: self._is_l3_page(entry, count or not self._is_user(entry), stack + (base,))
+            )
+        )
+
+    @instance_caching
+    def _is_pml4(self, base, count = False, stack = tuple()):
+        # Each PML4 entry must point to a valid PDPT
+        return self._for_each_present_entry(
+            base,
+            lambda entry: self._is_pdpt(entry & 0x000ffffffffff000, count or not self._is_user(entry), stack + (base,))
+        )
+
+    def get_pml4_coverage(self, base):
+        """Checks to see how much memory is covered by a suspected page table.
+        Returns 0 for an invalid page table"""
+        size = 0
+        known = set()
+        mapped = self._is_pml4(base)
+        for entry in mapped:
+            if entry is None:
+                return 0
+            begin, end = entry
+            if begin in known:
+                continue
+            known.add(begin) # FIXME: This doesn't cover the case that a piece of memory is re-mapped with another page size
+            size += end - begin
+        return size
+
+    def find_page_table_in_memory(self, log=None):
+        """Scans the ELFView to find the page table in memory"""
+        if not log:
+            log = lambda *args, **kwargs: None
+        # No CPU state in the memory dump or all CPUs in user mode (i.e. wrong CR3)
+        # Try to find the page table by scanning memory. Page table structures must be page-aligned.
+        pt_candidates = {}
+        next_page = lambda a: (a | 0xfff) + 1 if a & 0xfff else a # Round to next page start
+        for begin, end, buf, *_ in self._view._data:
+            start = next_page(begin)
+            pos = start
+            while pos < end:
+                log("CR3 not found, trying to find PML4 in memory: {:#x} {:#x} {:#x}".format(start, pos, end), end="\r")
+                coverage = self.get_pml4_coverage(pos)
+                if coverage:
+                    pt_candidates[pos] = coverage
+                pos = next_page(pos + 1)
+            log()
+
+        # Pick one. If KPTI is disabled, this is probably a userspace process, but the kernel is mapped there too
+        # If KPTI is enabled, there will be significantly fewer supervisor-mode mappings in userspace processes,
+        # and we should end up with the kernel page table.
+        assert len(pt_candidates) > 0, "Failed to find a reasonable page table"
+        cr3 = max(pt_candidates, key=pt_candidates.get)
+        log("Found page table at {:#x}".format(cr3))
+        return cr3
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+
+    any_int = lambda a: int(a, 0)
+
+    p = argparse.ArgumentParser()
+    p.add_argument("image")
+    p.add_argument("-l", "--length", help="Amount of memory to dump", type=any_int)
+    p.add_argument("-o", "--outfile", help="Output file for memory dump")
+    how = p.add_mutually_exclusive_group(required=True)
+    how.add_argument("-s", "--symbol", help="Start dumping at the specified symbol")
+    how.add_argument("-v", "--vaddr", help="Start dumping at the specified virtual address", type=any_int)
+    how.add_argument("-p", "--paddr", help="Start dumping at the specified physical address (but continue across page boundaries in virtual memory)", type=any_int)
+    how.add_argument("-L", "--list", help="List all loaded segments")
+    how.add_argument("-t", "--translate", help="Translate virt to phys address", type=any_int)
+    how.add_argument("-i", "--inverse-translate", help="Translate phys to virt address", type=any_int)
+    args = p.parse_args()
+    #view = ELFView(sys.argv[1])
+    #view.dump_maps()
+    #print(view.get(int(sys.argv[2],0), int(sys.argv[3],0)).hex())
+
+    view = autoselect(args.image, need_symbols=True, debug_paging=True)
+    print(f"Pointer Size: {view.pointer_size} CPU Arch: {view.cpu_arch} Byte Order: {view.byte_order}")
+
+    length = 0x4 if args.length is None else args.length
+    if args.vaddr:
+        d = view.get_virt(args.vaddr, length)
+        print(d.hex())
+    elif args.paddr:
+        d = view.get_phys(args.paddr, length)
+        print(d.hex())
+    elif args.symbol:
+        addr = view.lookup_symbol(args.symbol)
+        if addr is not None:
+            d = view.get_virt(addr, length)
+            print(d.hex())
+        else:
+            print("Unknown symbol")
+    elif args.translate:
+        print(hex(view.virt_to_phys(args.translate)))
+    elif args.inverse_translate:
+        for e in view.phys_to_virt(args.inverse_translate):
+            print(hex(e))
+    else:
+        for l in view.iter_loads():
+            print(hex(l[0]), hex(l[1]))
+        for m in view.mapping:
+            print(f"0x{m.virt:08x} 0x{m.phys:08x} 0x{m.size:x}")
+    #PageTableFinder(view._view).find_page_table_in_memory(print)
+    #print(view.get_virt(view.cpu_states[0].gdt.base, 0x1000).hex())

@@ -1,0 +1,7 @@
+Analyze regular vmlinux:
+    (1) Create a ghidra project
+    (2) Add the kernel to the ghidra project via the ghidra GUI
+    (3) When importing is done, exit the ghidra GUI
+    (4) Run gen-ghidra-symbols.py on the kernel file
+    (5) Run pcode/analyze-mapped-elf.sh $vmlinux_filename $fields_db_file
+        Note for the vmlinux: just pass the filename without any directories prepended e.g. "vmlinux-4.4.0-142-generic"
